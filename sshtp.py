@@ -2,17 +2,14 @@
 """
 SSHTP - Secure SSH Trust Pass
 
-Lightweight OpenSSH wrapper:
-- Encrypted password vault (AES-256-GCM)
+A lightweight OpenSSH wrapper that provides:
+- Encrypted SSH password vault (AES-256-GCM)
 - Master passphrase unlock
-- Optional pepper (SSHTP_PEPPER), unset by default
-- Host key pinning (TOFU + strict match), supports multiple host key algorithms
-- Fast command mode (--cmd)
-- Stable interactive mode (no lag) with sshpass -e when needed
+- Optional pepper via environment variable SSHTP_PEPPER (unset by default)
+- Host key pinning (TOFU + strict verification) with multi-key support
+- Fast one-shot command execution (--cmd)
+- Stable interactive sessions (uses sshpass -e when password auth is required)
 - Prefer SSH key for interactive mode; fallback to password
-
-Requested behavior:
-- Prompt Master passphrase first; if wrong, prompt real server password (one-time, not stored).
 """
 
 from __future__ import annotations
@@ -23,14 +20,17 @@ import getpass
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
 from shutil import which
 from typing import Dict, Optional, Tuple
 
+
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 APP_DIR = os.path.expanduser("~/.sshtp")
 VAULT_PATH = os.path.join(APP_DIR, "vault.json")
@@ -179,10 +179,6 @@ def fingerprint_sha256_from_keybytes(key_bytes: bytes) -> str:
 
 
 def ssh_keyscan_fingerprints(host: str, port: int, timeout: int) -> Dict[str, str]:
-    """
-    Return all available host key fingerprints discovered via ssh-keyscan.
-    Keys are stored as: { "ssh-ed25519": "SHA256:...", "ecdsa-sha2-nistp256": "SHA256:...", ... }
-    """
     require_command("ssh-keyscan")
 
     result: Dict[str, str] = {}
@@ -212,11 +208,6 @@ def ssh_keyscan_fingerprints(host: str, port: int, timeout: int) -> Dict[str, st
 
 
 def verify_or_pin_hostkeys(vault: Dict, host: str, port: int, seen_keys: Dict[str, str], accept_new: bool) -> None:
-    """
-    Multi-key pinning:
-    - On first pin (accept_new): store all discovered keys.
-    - On subsequent runs: accept if ANY discovered key matches ANY pinned key.
-    """
     hkdb = vault.setdefault("hostkeys", {})
     hid = host_id(host, port)
 
@@ -357,6 +348,44 @@ def run_ssh_password_interactive(host: str, port: int, user: str, timeout: int, 
         env.pop("SSHPASS", None)
 
 
+def format_epoch(ts: Optional[int]) -> str:
+    if not ts:
+        return "-"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except Exception:
+        return "-"
+
+
+def perm_str(path: str) -> str:
+    try:
+        m = os.stat(path).st_mode
+        return oct(stat.S_IMODE(m))
+    except Exception:
+        return "unknown"
+
+
+def is_perm_ok(path: str, expected: int) -> bool:
+    try:
+        m = os.stat(path).st_mode
+        return stat.S_IMODE(m) == expected
+    except Exception:
+        return False
+
+
+def confirm_accept_new(host: str, port: int, seen_keys: Dict[str, str], assume_yes: bool) -> None:
+    if assume_yes:
+        return
+    print("You are about to pin host keys for a new host (TOFU).")
+    print(f"Host: {host}:{port}")
+    print("Keys that will be pinned:")
+    for kt, fp in sorted(seen_keys.items()):
+        print(f"  {kt} {fp}")
+    answer = input('Type "YES" to continue: ').strip()
+    if answer != "YES":
+        exit_with("Aborted by user.", 1)
+
+
 def cmd_init(_: argparse.Namespace) -> None:
     vault = load_vault()
     save_vault(vault)
@@ -401,6 +430,74 @@ def cmd_list(_: argparse.Namespace) -> None:
         print(f"{name}: {e['user']}@{e['host']}:{e.get('port', 22)} ({pinned})")
 
 
+def cmd_status(_: argparse.Namespace) -> None:
+    vault = load_vault()
+    entries = vault.get("entries", {})
+    if not entries:
+        print("No entries.")
+        return
+
+    print("Alias  Target                      PinnedKeys  LastSeen              Created")
+    print("-----  --------------------------  ---------  --------------------  --------------------")
+    for name, e in sorted(entries.items(), key=lambda x: x[0]):
+        host = e.get("host", "?")
+        user = e.get("user", "?")
+        port = int(e.get("port", 22))
+        hid = host_id(host, port)
+
+        hk = vault.get("hostkeys", {}).get(hid, {})
+        keys = hk.get("keys", {}) if isinstance(hk, dict) else {}
+        key_count = len(keys) if isinstance(keys, dict) else 0
+
+        last_seen = format_epoch(hk.get("seen_at") if isinstance(hk, dict) else None)
+        created = format_epoch(e.get("created_at"))
+
+        target = f"{user}@{host}:{port}"
+        print(f"{name:<5}  {target:<26}  {key_count:<9}  {last_seen:<20}  {created}")
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    vault = load_vault()
+    entry = vault.get("entries", {}).get(args.name)
+    if entry is None:
+        exit_with(f"Entry '{args.name}' not found.", 1)
+
+    host = entry.get("host", "?")
+    user = entry.get("user", "?")
+    port = int(entry.get("port", 22))
+    hid = host_id(host, port)
+
+    print(f"Alias:   {args.name}")
+    print(f"Target:  {user}@{host}:{port}")
+    print(f"Created: {format_epoch(entry.get('created_at'))}")
+    note = entry.get("note") or ""
+    print(f"Note:    {note if note else '-'}")
+
+    kdf = entry.get("kdf", {})
+    kdf_name = kdf.get("name", "?")
+    kdf_params = kdf.get("params", {}) if isinstance(kdf.get("params", {}), dict) else {}
+    print("KDF:")
+    print(f"  Name: {kdf_name}")
+    if kdf_params:
+        for k in sorted(kdf_params.keys()):
+            print(f"  {k}: {kdf_params[k]}")
+
+    hk = vault.get("hostkeys", {}).get(hid)
+    if not hk:
+        print("Host keys: not pinned")
+        return
+
+    print("Host keys:")
+    print(f"  Added:    {format_epoch(hk.get('added_at'))}")
+    print(f"  LastSeen: {format_epoch(hk.get('seen_at'))}")
+    keys = hk.get("keys", {})
+    if isinstance(keys, dict) and keys:
+        for kt, fp in sorted(keys.items()):
+            print(f"  {kt} {fp}")
+    else:
+        print("  (no keys stored)")
+
+
 def cmd_remove(args: argparse.Namespace) -> None:
     vault = load_vault()
     if args.name not in vault.get("entries", {}):
@@ -408,6 +505,71 @@ def cmd_remove(args: argparse.Namespace) -> None:
     del vault["entries"][args.name]
     save_vault(vault)
     print(f"Removed entry '{args.name}'")
+
+
+def cmd_doctor(_: argparse.Namespace) -> None:
+    print("SSHTP doctor report")
+    print()
+
+    deps = ["ssh", "sshpass", "ssh-keyscan"]
+    ok = True
+
+    print("Dependencies:")
+    for d in deps:
+        path = which(d)
+        if path:
+            print(f"  {d}: OK ({path})")
+        else:
+            print(f"  {d}: MISSING")
+            ok = False
+
+    print()
+    print("Paths:")
+    print(f"  APP_DIR:   {APP_DIR}")
+    print(f"  VAULT:     {VAULT_PATH}")
+    print()
+
+    print("Permissions:")
+    if os.path.isdir(APP_DIR):
+        p = perm_str(APP_DIR)
+        good = is_perm_ok(APP_DIR, 0o700)
+        print(f"  {APP_DIR}: {p} ({'OK' if good else 'recommended 0o700'})")
+        if not good:
+            ok = False
+    else:
+        print(f"  {APP_DIR}: not found (run: python sshtp.py init)")
+        ok = False
+
+    if os.path.isfile(VAULT_PATH):
+        p = perm_str(VAULT_PATH)
+        good = is_perm_ok(VAULT_PATH, 0o600)
+        print(f"  {VAULT_PATH}: {p} ({'OK' if good else 'recommended 0o600'})")
+        if not good:
+            ok = False
+    else:
+        print(f"  {VAULT_PATH}: not found (run: python sshtp.py init)")
+        ok = False
+
+    print()
+    print("SSH keys:")
+    k = find_ssh_key()
+    if k:
+        print(f"  Found: {k}")
+    else:
+        print("  No default key found in ~/.ssh (id_ed25519/id_ed25519_sk/id_rsa)")
+        print("  This is fine if you use password auth, but key auth is recommended.")
+
+    print()
+    print("Environment:")
+    pepper = os.environ.get("SSHTP_PEPPER", "")
+    print(f"  SSHTP_PEPPER: {'SET' if pepper else 'UNSET (default)'}")
+
+    print()
+    if ok:
+        print("Result: OK")
+        raise SystemExit(0)
+    print("Result: ISSUES FOUND")
+    raise SystemExit(1)
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -421,6 +583,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     port = int(entry.get("port", 22))
 
     seen_keys = ssh_keyscan_fingerprints(host, port, args.timeout)
+
+    hid = host_id(host, port)
+    pinned_exists = hid in vault.get("hostkeys", {})
+    if args.accept_new and not pinned_exists:
+        confirm_accept_new(host, port, seen_keys, assume_yes=args.yes)
+
     verify_or_pin_hostkeys(vault, host, port, seen_keys, accept_new=args.accept_new)
 
     if args.cmd:
@@ -476,6 +644,9 @@ def build_parser() -> argparse.ArgumentParser:
         "  Run a command and exit:\n"
         "    python sshtp.py kaito --cmd \"uptime && whoami\"\n"
         "\n"
+        "  Diagnostics:\n"
+        "    python sshtp.py doctor\n"
+        "\n"
         "Environment:\n"
         "  SSHTP_PEPPER      Optional extra secret for KDF input (default: unset/empty).\n"
         "  SSHTP_SCRYPT_N    Scrypt N parameter (default: 32768). Example: 65536.\n"
@@ -504,46 +675,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Add or overwrite an encrypted SSH password entry in the vault.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_add.add_argument(
-        "--name",
-        required=True,
-        metavar="ALIAS",
-        help="Connection alias used later to run SSHTP (example: kaito).",
-    )
-    p_add.add_argument(
-        "--host",
-        required=True,
-        metavar="HOST",
-        help="SSH server hostname or IP address.",
-    )
-    p_add.add_argument(
-        "--user",
-        required=True,
-        metavar="USER",
-        help="SSH username for the connection.",
-    )
-    p_add.add_argument(
-        "--port",
-        type=int,
-        default=22,
-        metavar="PORT",
-        help="SSH port number (default: 22).",
-    )
-    p_add.add_argument(
-        "--note",
-        metavar="TEXT",
-        help="Optional note stored with the entry (no secrets).",
-    )
-    p_add.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite the entry if it already exists.",
-    )
-    p_add.add_argument(
-        "--confirm",
-        action="store_true",
-        help="Require typing the master passphrase twice when adding an entry.",
-    )
+    p_add.add_argument("--name", required=True, metavar="ALIAS", help="Connection alias (example: kaito).")
+    p_add.add_argument("--host", required=True, metavar="HOST", help="SSH server hostname or IP address.")
+    p_add.add_argument("--user", required=True, metavar="USER", help="SSH username for the connection.")
+    p_add.add_argument("--port", type=int, default=22, metavar="PORT", help="SSH port number (default: 22).")
+    p_add.add_argument("--note", metavar="TEXT", help="Optional note stored with the entry (no secrets).")
+    p_add.add_argument("--force", action="store_true", help="Overwrite the entry if it already exists.")
+    p_add.add_argument("--confirm", action="store_true", help="Require typing the master passphrase twice.")
     p_add.set_defaults(func=cmd_add)
 
     p_list = subs.add_parser(
@@ -553,18 +691,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_list.set_defaults(func=cmd_list)
 
+    p_status = subs.add_parser(
+        "status",
+        help="Show a compact summary (targets, pinned keys, last seen).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_status.set_defaults(func=cmd_status)
+
+    p_show = subs.add_parser(
+        "show",
+        help="Show details for one entry (no secrets).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_show.add_argument("--name", required=True, metavar="ALIAS", help="Connection alias to show.")
+    p_show.set_defaults(func=cmd_show)
+
     p_remove = subs.add_parser(
         "remove",
         help="Remove a connection entry from the vault.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_remove.add_argument(
-        "--name",
-        required=True,
-        metavar="ALIAS",
-        help="Connection alias to remove.",
-    )
+    p_remove.add_argument("--name", required=True, metavar="ALIAS", help="Connection alias to remove.")
     p_remove.set_defaults(func=cmd_remove)
+
+    p_doctor = subs.add_parser(
+        "doctor",
+        help="Check dependencies and file permissions for common issues.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_run = subs.add_parser(
         "run",
@@ -581,21 +736,17 @@ def build_parser() -> argparse.ArgumentParser:
             "  - Uses password auth to execute the command and exit.\n"
         ),
     )
-    p_run.add_argument(
-        "--name",
-        required=True,
-        metavar="ALIAS",
-        help="Connection alias to use (example: kaito).",
-    )
-    p_run.add_argument(
-        "--cmd",
-        metavar="COMMAND",
-        help="Command to run remotely and exit (non-interactive).",
-    )
+    p_run.add_argument("--name", required=True, metavar="ALIAS", help="Connection alias to use (example: kaito).")
+    p_run.add_argument("--cmd", metavar="COMMAND", help="Remote command to run and exit (non-interactive).")
     p_run.add_argument(
         "--accept-new",
         action="store_true",
-        help="Trust-on-first-use (TOFU): pin host keys on first connection for this host:port.",
+        help="TOFU pinning: allow pinning host keys if this host:port is not pinned yet.",
+    )
+    p_run.add_argument(
+        "--yes",
+        action="store_true",
+        help='Non-interactive approval for --accept-new (skips "Type YES" prompt).',
     )
     p_run.add_argument(
         "--timeout",
@@ -629,7 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def shortcut_mode(argv: list[str]) -> list[str]:
-    reserved = {"init", "add", "list", "remove", "run"}
+    reserved = {"init", "add", "list", "status", "show", "remove", "doctor", "run"}
     if len(argv) >= 2 and not argv[1].startswith("-") and argv[1] not in reserved:
         return ["run", "--name", argv[1]] + argv[2:]
     return argv[1:]
